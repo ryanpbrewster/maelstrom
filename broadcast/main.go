@@ -2,9 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"os"
 	"sync"
 	"time"
 
@@ -13,12 +11,6 @@ import (
 
 func main() {
 	n := maelstrom.NewNode()
-
-	fout, err := os.CreateTemp("", "maelstrom-brodcast")
-	if err != nil {
-		log.Fatal(err)
-	}
-	l := log.New(fout, fmt.Sprintf("[%v]", n.ID()), log.LstdFlags)
 
 	seen := make(map[int]struct{})
 	var neighbors []string
@@ -37,7 +29,7 @@ func main() {
 		for {
 			select {
 			case ack := <-acks:
-				l.Printf("ack %+v", ack)
+				log.Printf("ack %+v", ack)
 				delete(pending, ack)
 				continue
 			case req := <-incoming:
@@ -51,7 +43,7 @@ func main() {
 
 			for p := range pending {
 				p := p
-				l.Printf("fanout %+v", p)
+				log.Printf("fanout %+v", p)
 				n.RPC(p.target, p.req, func(msg maelstrom.Message) error {
 					acks <- p
 					return nil
@@ -61,7 +53,7 @@ func main() {
 	}()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		l.Printf("recv broadcast: %s", msg.Body)
+		log.Printf("recv broadcast: %s", msg.Body)
 
 		var body broadcastRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -73,7 +65,7 @@ func main() {
 			seen[body.Message] = struct{}{}
 			incoming <- body
 		} else {
-			l.Printf("already seen %d", body.Message)
+			log.Printf("already seen %d", body.Message)
 		}
 		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
@@ -84,7 +76,7 @@ func main() {
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		l.Printf("recv read: %s", msg.Body)
+		log.Printf("recv read: %s", msg.Body)
 		mu.Lock()
 		defer mu.Unlock()
 		messages := make([]int, 0, len(seen))
@@ -95,7 +87,7 @@ func main() {
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		l.Printf("recv topology: %s", msg.Body)
+		log.Printf("recv topology: %s", msg.Body)
 		var body topologyRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -103,7 +95,7 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 		neighbors = body.Topology[n.ID()]
-		l.Printf("set neighbors=%v", neighbors)
+		log.Printf("set neighbors=%v", neighbors)
 
 		return n.Reply(msg, map[string]any{"type": "topology_ok"})
 	})

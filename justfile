@@ -20,3 +20,7 @@ broadcast-multi:
 broadcast-faulty:
 	cd broadcast && go build main.go
 	cd maelstrom && ./maelstrom test -w broadcast --bin ../broadcast/main --node-count 5 --time-limit 20 --rate 10 --nemesis partition
+
+broadcast-lag:
+	cd broadcast && go build main.go
+	cd maelstrom && ./maelstrom test -w broadcast --bin ../broadcast/main --node-count 5 --time-limit 20 --rate 10 --latency 100
