@@ -7,4 +7,4 @@ echo:
 
 unique-ids:
 	cd unique-ids && go build main.go
-	cd maelstrom && ./maelstrom test -w unique-ids --bin ../unique-ids/main --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
+	cd maelstrom && ./maelstrom test -w unique-ids --bin ../unique-ids/main --time-limit 10 --rate 1000 --node-count 3 --availability total --nemesis partition
