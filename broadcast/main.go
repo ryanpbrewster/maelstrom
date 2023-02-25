@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -23,6 +24,42 @@ func main() {
 	var neighbors []string
 	var mu sync.Mutex
 
+	type broadcastKey struct {
+		target string
+		req    broadcastRequest
+	}
+	incoming := make(chan broadcastRequest, 256)
+	go func() error {
+		pending := make(map[broadcastKey]struct{})
+		acks := make(chan broadcastKey)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case ack := <-acks:
+				l.Printf("ack %+v", ack)
+				delete(pending, ack)
+				continue
+			case req := <-incoming:
+				mu.Lock()
+				for _, neighbor := range neighbors {
+					pending[broadcastKey{target: neighbor, req: req}] = struct{}{}
+				}
+				mu.Unlock()
+			case <-ticker.C:
+			}
+
+			for p := range pending {
+				p := p
+				l.Printf("fanout %+v", p)
+				n.RPC(p.target, p.req, func(msg maelstrom.Message) error {
+					acks <- p
+					return nil
+				})
+			}
+		}
+	}()
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		l.Printf("recv broadcast: %s", msg.Body)
 
@@ -34,11 +71,7 @@ func main() {
 		defer mu.Unlock()
 		if _, ok := seen[body.Message]; !ok {
 			seen[body.Message] = struct{}{}
-			l.Printf("%d is new", body.Message)
-			for _, neighbor := range neighbors {
-				l.Printf("mirroring to %v: %+v", neighbor, body)
-				n.Send(neighbor, body)
-			}
+			incoming <- body
 		} else {
 			l.Printf("already seen %d", body.Message)
 		}
