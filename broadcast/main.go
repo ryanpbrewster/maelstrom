@@ -19,7 +19,7 @@ func main() {
 
 	kick := make(chan struct{}, 1)
 	go func() error {
-		ticker := time.NewTicker(50 * time.Millisecond)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -29,6 +29,7 @@ func main() {
 
 			mu.Lock()
 			for _, neighbor := range neighbors {
+				neighbor := neighbor
 				var missing []int
 				for m := range seen {
 					if _, ok := known[neighbor][m]; !ok {
