@@ -28,3 +28,7 @@ broadcast-lag:
 g-counter:
 	cd g-counter && go build main.go
 	cd maelstrom && ./maelstrom test -w g-counter --bin ../g-counter/main --node-count 3 --rate 100 --time-limit 10 --nemesis partition
+
+kafka-single:
+	cd kafka && go build main.go
+	cd maelstrom && ./maelstrom test -w kafka --bin ../kafka/main --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
