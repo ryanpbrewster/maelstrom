@@ -13,59 +13,61 @@ func main() {
 	n := maelstrom.NewNode()
 
 	seen := make(map[int]struct{})
+	known := make(map[string]map[int]struct{})
 	var neighbors []string
 	var mu sync.Mutex
 
-	type broadcastKey struct {
-		target string
-		req    broadcastRequest
-	}
-	incoming := make(chan broadcastRequest, 256)
+	kick := make(chan struct{}, 1)
 	go func() error {
-		pending := make(map[broadcastKey]struct{})
-		acks := make(chan broadcastKey)
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
-			case ack := <-acks:
-				log.Printf("ack %+v", ack)
-				delete(pending, ack)
-				continue
-			case req := <-incoming:
-				mu.Lock()
-				for _, neighbor := range neighbors {
-					pending[broadcastKey{target: neighbor, req: req}] = struct{}{}
-				}
-				mu.Unlock()
+			case <-kick:
 			case <-ticker.C:
 			}
 
-			for p := range pending {
-				p := p
-				log.Printf("fanout %+v", p)
-				n.RPC(p.target, p.req, func(msg maelstrom.Message) error {
-					acks <- p
-					return nil
-				})
+			mu.Lock()
+			for _, neighbor := range neighbors {
+				var missing []int
+				for m := range seen {
+					if _, ok := known[neighbor][m]; !ok {
+						missing = append(missing, m)
+					}
+				}
+				if len(missing) > 0 {
+					n.RPC(neighbor, gossipRequest{Type: "gossip", Messages: missing}, func(msg maelstrom.Message) error {
+						mu.Lock()
+						for _, m := range missing {
+							known[neighbor][m] = struct{}{}
+						}
+						mu.Unlock()
+						return nil
+					})
+				}
 			}
+			mu.Unlock()
 		}
 	}()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		log.Printf("recv broadcast: %s", msg.Body)
-
 		var body broadcastRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 		mu.Lock()
 		defer mu.Unlock()
+
+		learned := false
 		if _, ok := seen[body.Message]; !ok {
 			seen[body.Message] = struct{}{}
-			incoming <- body
-		} else {
-			log.Printf("already seen %d", body.Message)
+			learned = true
+		}
+		if learned {
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
 		}
 		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
@@ -75,8 +77,37 @@ func main() {
 		return nil
 	})
 
+	n.Handle("gossip", func(msg maelstrom.Message) error {
+		var body gossipRequest
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+
+		learned := false
+		for _, m := range body.Messages {
+			known[msg.Src][m] = struct{}{}
+			if _, ok := seen[m]; !ok {
+				seen[m] = struct{}{}
+				learned = true
+			}
+		}
+		if learned {
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
+		}
+		return n.Reply(msg, map[string]any{"type": "gossip_ok"})
+	})
+
+	n.Handle("gossip_ok", func(msg maelstrom.Message) error {
+		// Our partner nodes will ack our gossips, and right now we're just ignoring that.
+		return nil
+	})
+
 	n.Handle("read", func(msg maelstrom.Message) error {
-		log.Printf("recv read: %s", msg.Body)
 		mu.Lock()
 		defer mu.Unlock()
 		messages := make([]int, 0, len(seen))
@@ -87,7 +118,6 @@ func main() {
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		log.Printf("recv topology: %s", msg.Body)
 		var body topologyRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -95,7 +125,9 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 		neighbors = body.Topology[n.ID()]
-		log.Printf("set neighbors=%v", neighbors)
+		for _, neighbor := range neighbors {
+			known[neighbor] = make(map[int]struct{})
+		}
 
 		return n.Reply(msg, map[string]any{"type": "topology_ok"})
 	})
@@ -108,6 +140,11 @@ func main() {
 type broadcastRequest struct {
 	Type    string `json:"type"`
 	Message int    `json:"message"`
+}
+
+type gossipRequest struct {
+	Type     string `json:"type"`
+	Messages []int  `json:"messages"`
 }
 
 type topologyRequest struct {
