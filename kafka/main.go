@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -11,7 +13,7 @@ import (
 func main() {
 	n := maelstrom.NewNode()
 
-	s := newSrv()
+	s := newSrv(n)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body sendRequest
@@ -19,7 +21,10 @@ func main() {
 			return err
 		}
 
-		offset := s.send(body)
+		offset, err := s.send(body)
+		if err != nil {
+			return err
+		}
 		return n.Reply(msg, sendResponse{
 			Type:   "send_ok",
 			Offset: offset,
@@ -31,9 +36,13 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+		msgs, err := s.poll(body)
+		if err != nil {
+			return err
+		}
 		return n.Reply(msg, pollResponse{
 			Type: "poll_ok",
-			Msgs: s.poll(body),
+			Msgs: msgs,
 		})
 	})
 
@@ -53,9 +62,14 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
+		offsets, err := s.listCommittedOffsets(body)
+		if err != nil {
+			return err
+		}
 		return n.Reply(msg, listCommittedOffsetsResponse{
 			Type:    "list_committed_offsets_ok",
-			Offsets: s.listCommittedOffsets(body),
+			Offsets: offsets,
 		})
 	})
 
@@ -114,66 +128,142 @@ type listCommittedOffsetsResponse struct {
 }
 
 type srv struct {
-	mu        sync.Mutex
-	topics    map[string][]record
-	committed map[string]int
+	kv *maelstrom.KV
 }
 
-func newSrv() *srv {
+func newSrv(n *maelstrom.Node) *srv {
 	return &srv{
-		topics:    make(map[string][]record),
-		committed: make(map[string]int),
+		kv: maelstrom.NewLinKV(n),
 	}
 }
 
-func (s *srv) send(req sendRequest) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	topic := s.topics[req.Key]
-	offset := 0
-	if len(topic) > 0 {
-		offset = topic[len(topic)-1].offset + 1
+func (s *srv) send(req sendRequest) (int, error) {
+	offset, err := s.incrementAndGetOffer(pendingPrefix, req.Key)
+	if err != nil {
+		return 0, err
 	}
-	s.topics[req.Key] = append(topic, record{offset: offset, msg: req.Msg})
-	return offset
+
+	if err := s.appendLogEntry(req.Key, record{msg: req.Msg, offset: offset}); err != nil {
+		return 0, err
+	}
+	return offset, nil
 }
 
-func (s *srv) poll(req pollRequest) map[string][]record {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *srv) poll(req pollRequest) (map[string][]record, error) {
 	result := make(map[string][]record)
 	for key, offset := range req.Offsets {
-		for _, record := range s.topics[key] {
-			if record.offset >= offset {
-				result[key] = append(result[key], record)
+		for i := 0; i < 10; i++ {
+			if r, err := s.readLogEntry(key, offset+i); err != nil {
+				return nil, err
+			} else if r != nil {
+				result[key] = append(result[key], *r)
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
-func (s *srv) commitOffsets(req commitOffsetsRequest) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *srv) commitOffsets(req commitOffsetsRequest) error {
 	for key, offset := range req.Offsets {
-		if cur, ok := s.committed[key]; ok && cur > offset {
-			continue
+		if err := s.maxOffset(committedPrefix, key, offset); err != nil {
+			return err
 		}
-		s.committed[key] = offset
 	}
+	return nil
 }
 
-func (s *srv) listCommittedOffsets(req listCommittedOffsetsRequest) map[string]int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *srv) listCommittedOffsets(req listCommittedOffsetsRequest) (map[string]int, error) {
 	result := make(map[string]int)
 	for _, key := range req.Keys {
-		if offset, ok := s.committed[key]; ok {
+		offset, ok, err := s.getOffset(committedPrefix, key)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			result[key] = offset
 		}
 	}
-	return result
+	return result, nil
+}
+
+const pendingPrefix = "pending"
+const committedPrefix = "committed"
+
+func (s *srv) incrementAndGetOffer(prefix, key string) (int, error) {
+	loc := prefix + "/" + key
+	for {
+		cur, keyExists, err := s.getOffset(prefix, key)
+		if err != nil {
+			return 0, err
+		}
+
+		next := cur + 1
+		if err := s.kv.CompareAndSwap(context.TODO(), loc, cur, next, !keyExists); err != nil {
+			var rpcerr *maelstrom.RPCError
+			if errors.As(err, &rpcerr) && rpcerr.Code == maelstrom.PreconditionFailed {
+				continue
+			} else {
+				return 0, err
+			}
+		}
+		return next, nil
+	}
+}
+
+func (s *srv) maxOffset(prefix, key string, target int) error {
+	loc := prefix + "/" + key
+	for {
+		cur, keyExists, err := s.getOffset(prefix, key)
+		if err != nil {
+			return err
+		}
+
+		next := target
+		if keyExists && next < cur {
+			next = cur
+		}
+
+		if err := s.kv.CompareAndSwap(context.TODO(), loc, cur, next, !keyExists); err != nil {
+			var rpcerr *maelstrom.RPCError
+			if errors.As(err, &rpcerr) && rpcerr.Code == maelstrom.PreconditionFailed {
+				continue
+			} else {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func (s *srv) getOffset(prefix, key string) (int, bool, error) {
+	loc := prefix + "/" + key
+	cur, err := s.kv.ReadInt(context.TODO(), loc)
+	if err != nil {
+		var rpcerr *maelstrom.RPCError
+		if errors.As(err, &rpcerr) && rpcerr.Code == maelstrom.KeyDoesNotExist {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return cur, true, nil
+}
+
+const recordsPrefix = "records"
+
+func (s *srv) appendLogEntry(key string, r record) error {
+	loc := fmt.Sprintf("%s/%s/%d", recordsPrefix, key, r.offset)
+	return s.kv.Write(context.TODO(), loc, r.msg)
+}
+
+func (s *srv) readLogEntry(key string, offset int) (*record, error) {
+	loc := fmt.Sprintf("%s/%s/%d", recordsPrefix, key, offset)
+	msg, err := s.kv.ReadInt(context.TODO(), loc)
+	if err != nil {
+		var rpcerr *maelstrom.RPCError
+		if errors.As(err, &rpcerr) && rpcerr.Code == maelstrom.KeyDoesNotExist {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &record{offset: offset, msg: msg}, nil
 }
